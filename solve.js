@@ -655,11 +655,19 @@ function parseTemplate(name, src) {
 
 /** The value at `path` in the scope chain: its first name from the nearest scope holding it, then own properties. */
 function lookup(scope, path) {
+  // Scope vars objects have a null prototype, so a direct read is exactly
+  // an own-property test (no inherited names can leak in); a key holding
+  // undefined reads exactly like an absent key, which lookup already
+  // treats as undefined (topVars clears page/posts/pager/tag to undefined,
+  // and a loop var is always bound before its body renders).
   let s = scope;
   const first = path[0];
-  while (s !== null && !Object.hasOwn(s.vars, first)) s = s.parent;
-  if (s === null) return undefined;
   let v = s.vars[first];
+  while (v === undefined && s.parent !== null) {
+    s = s.parent;
+    v = s.vars[first];
+  }
+  if (v === undefined) return undefined;
   for (let k = 1; k < path.length; k++) {
     if (v === null || typeof v !== 'object' || !Object.hasOwn(v, path[k])) return undefined;
     v = v[path[k]];
@@ -697,7 +705,7 @@ function truthy(v) {
  * scope object and one loop record across its elements (rendering is
  * synchronous, so nothing can observe a stale value).
  */
-function renderNodes(nodes, scope, ctx, depth, out) {
+function renderNodes(nodes, scope, ctx, depth, out, shadowed = false) {
   for (let ni = 0; ni < nodes.length; ni++) {
     const n = nodes[ni];
     switch (n.kind) {
@@ -712,7 +720,7 @@ function renderNodes(nodes, scope, ctx, depth, out) {
         break;
       case 'if': {
         const branch = truthy(lookup(scope, n.path)) !== n.not ? n.then : n.else;
-        if (branch !== null) renderNodes(branch, scope, ctx, depth, out);
+        if (branch !== null) renderNodes(branch, scope, ctx, depth, out, shadowed);
         break;
       }
       case 'for': {
@@ -723,7 +731,7 @@ function renderNodes(nodes, scope, ctx, depth, out) {
         // actually named "loop" still reads as the loop record, as in the
         // reference's { [name]: x, loop: {...} } literal.
         const loop = { index: 1, first: true, last: len === 1, length: len };
-        const vars = {};
+        const vars = Object.create(null);
         vars[n.name] = undefined;
         vars.loop = loop;
         const child = { vars, parent: scope };
@@ -733,13 +741,44 @@ function renderNodes(nodes, scope, ctx, depth, out) {
           loop.index = k + 1;
           loop.first = k === 0;
           loop.last = k === len - 1;
-          renderNodes(n.body, child, ctx, depth, out);
+          renderNodes(n.body, child, ctx, depth, out, shadowed || n.name === 'site' || n.name === 'tags' || n.name === 'recent');
         }
         break;
       }
       case 'include': {
+        const sd = ctx.staticInfo.get(n.name);
+        if (sd !== undefined && !shadowed && depth + 1 + sd < INCLUDE_DEPTH) {
+          const cached = ctx.staticCache.get(n.name);
+          if (cached !== undefined) {
+            out.push(cached);
+            break;
+          }
+        }
+        const mi = ctx.memoInfo.get(n.name);
+        if (mi !== undefined && !shadowed && depth + 1 + mi.depth < INCLUDE_DEPTH) {
+          const key = lookup(scope, mi.path);
+          let per = ctx.memoCache.get(n.name);
+          if (per === undefined) {
+            per = new Map();
+            ctx.memoCache.set(n.name, per);
+          }
+          const hit = per.get(key);
+          if (hit !== undefined) {
+            out.push(hit);
+            break;
+          }
+          const t = ctx.templates.get(n.name);
+          if (t !== undefined && depth < INCLUDE_DEPTH) {
+            const sub = [];
+            renderNodes(t, scope, ctx, depth + 1, sub, shadowed);
+            const s = sub.join('');
+            per.set(key, s);
+            out.push(s);
+          }
+          break;
+        }
         const t = ctx.templates.get(n.name);
-        if (t !== undefined && depth < INCLUDE_DEPTH) renderNodes(t, scope, ctx, depth + 1, out);
+        if (t !== undefined && depth < INCLUDE_DEPTH) renderNodes(t, scope, ctx, depth + 1, out, shadowed);
         break;
       }
     }
@@ -764,18 +803,10 @@ const WS_RE = /\s/;
  * per word. ASCII whitespace is 9-13 and 32; anything else is checked
  * against \s only when a non-ASCII character actually appears. */
 function wordsOf(text) {
-  let count = 0;
-  let inWord = false;
-  for (let i = 0; i < text.length; i++) {
-    const c = text.charCodeAt(i);
-    const ws = c === 32 || (c >= 9 && c <= 13) || (c >= 128 && WS_RE.test(text[i]));
-    if (ws) inWord = false;
-    else if (!inWord) {
-      inWord = true;
-      count++;
-    }
-  }
-  return count;
+  if (text.length === 0) return 0;
+  const m = text.match(/\s+/g);
+  if (m === null) return 1;
+  return m.length + 1 - (WS_RE.test(text[0]) ? 1 : 0) - (WS_RE.test(text[text.length - 1]) ? 1 : 0);
 }
 
 /** `rel` (a link's path, "/"-separated) from the directory parts of a source, or null when it climbs out of the root. */
@@ -879,7 +910,8 @@ export function run(input) {
     const srcPath = s.path;
     const env = {
       link: (target) => {
-        if (SCHEME_RE.test(target) || target.charCodeAt(0) === 47 || target.charCodeAt(0) === 35) return target;
+        if (target.indexOf(':') !== -1 && SCHEME_RE.test(target)) return target;
+        if (target.charCodeAt(0) === 47 || target.charCodeAt(0) === 35) return target;
         const hash = target.indexOf('#');
         const rel = hash === -1 ? target : target.slice(0, hash);
         const frag = hash === -1 ? '' : target.slice(hash);
@@ -968,11 +1000,146 @@ export function run(input) {
   const site = { title: input.site.title, base_url: base };
   const allTags = tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = posts.slice(0, input.site.recent).map((p) => cards.get(p));
-  const ctx = { templates };
+  const ctx = { templates, staticInfo: new Map(), staticCache: new Map(), memoInfo: new Map(), memoCache: new Map() };
+  // Static templates: output depends only on the case-level scope
+  // (site, tags, recent), so one render per case is reused everywhere.
+  // Analysis walks parsed nodes with a bound-var env: a first segment is
+  // static when it is a case-level name or a loop var bound over a static
+  // collection. A for over a dynamic collection is dynamic even if its
+  // body never names the loop var (the repetition count itself depends
+  // on it), as is an if on a dynamic condition. Cycles are dynamic.
+  // staticInfo maps a static template to its longest include chain below
+  // it; the cache is only used where that whole chain still fits under
+  // the include-depth limit, and never where an enclosing for-loop var
+  // shadows site/tags/recent (tracked as `shadowed` in renderNodes).
+  {
+    const CASE_LEVEL = new Set(['site', 'tags', 'recent']);
+    const memo = new Map();
+    const visiting = new Set();
+    const firstStatic = (path, bound) => {
+      const f = path[0];
+      return bound.has(f) ? bound.get(f) : CASE_LEVEL.has(f);
+    };
+    const analyze = (name, bound) => {
+      const key = name + '|' + [...bound.entries()].sort().map(([k, v]) => k + ':' + (v ? 1 : 0)).join(',');
+      const hit = memo.get(key);
+      if (hit !== undefined) return hit;
+      if (visiting.has(key)) return { ok: false, depth: Infinity };
+      const nodes = templates.get(name);
+      if (nodes === undefined) return { ok: true, depth: 0 };
+      visiting.add(key);
+      let ok = true;
+      let depth = 0;
+      const walk = (ns, b) => {
+        for (const n of ns) {
+          if (!ok) return;
+          if (n.kind === 'var' || n.kind === 'raw') {
+            if (!firstStatic(n.path, b)) ok = false;
+          } else if (n.kind === 'if') {
+            if (!firstStatic(n.path, b)) ok = false;
+            else {
+              walk(n.then, b);
+              if (n.else !== null) walk(n.else, b);
+            }
+          } else if (n.kind === 'for') {
+            if (!firstStatic(n.path, b)) ok = false;
+            else {
+              const b2 = new Map(b);
+              b2.set(n.name, true);
+              walk(n.body, b2);
+            }
+          } else if (n.kind === 'include') {
+            const sub = analyze(n.name, b);
+            if (!sub.ok) ok = false;
+            else if (sub.depth + 1 > depth) depth = sub.depth + 1;
+          }
+        }
+      };
+      walk(nodes, bound);
+      visiting.delete(key);
+      const res = { ok, depth: ok ? depth : Infinity };
+      memo.set(key, res);
+      return res;
+    };
+    for (const name of templates.keys()) {
+      const r = analyze(name, new Map());
+      if (r.ok) ctx.staticInfo.set(name, r.depth);
+    }
+  }
+  // Memoizable templates: output is a pure function of one external value
+  // (plus the fixed case-level scope). A template qualifies when every
+  // free first-segment is case-level, bound inside the template itself,
+  // or one single external name; 'loop' never qualifies (it is the
+  // iteration record, not a function of one value). Cycles are not
+  // memoizable. The render is then cached per (template, value): a post's
+  // card, rendered once per index page and once per tag page, is built
+  // once and reused ~3x. memoInfo maps name -> { var, path, depth }.
+  {
+    const CASE_LEVEL = new Set(['site', 'tags', 'recent']);
+    const memo = new Map();
+    const visiting = new Set();
+    const analyzeMemo = (name) => {
+      const hit = memo.get(name);
+      if (hit !== undefined) return hit;
+      if (visiting.has(name)) return { ok: false, ext: null, depth: Infinity };
+      const nodes = templates.get(name);
+      if (nodes === undefined) return { ok: true, ext: new Set(), depth: 0 };
+      visiting.add(name);
+      let ok = true;
+      const ext = new Set();
+      let depth = 0;
+      const check = (path, bound) => {
+        const f = path[0];
+        if (f === 'loop') { ok = false; return; }
+        if (bound.has(f)) return;
+        if (CASE_LEVEL.has(f)) return;
+        ext.add(f);
+      };
+      const walk = (ns, bound) => {
+        for (const n of ns) {
+          if (!ok) return;
+          if (n.kind === 'var' || n.kind === 'raw') check(n.path, bound);
+          else if (n.kind === 'if') {
+            check(n.path, bound);
+            if (ok) {
+              walk(n.then, bound);
+              if (n.else !== null) walk(n.else, bound);
+            }
+          } else if (n.kind === 'for') {
+            check(n.path, bound);
+            if (!ok) return;
+            const b2 = new Set(bound);
+            b2.add(n.name);
+            walk(n.body, b2);
+          } else if (n.kind === 'include') {
+            const sub = analyzeMemo(n.name);
+            if (!sub.ok) { ok = false; return; }
+            for (const v of sub.ext) if (!bound.has(v)) ext.add(v);
+            if (sub.depth + 1 > depth) depth = sub.depth + 1;
+          }
+        }
+      };
+      walk(nodes, new Set());
+      visiting.delete(name);
+      const res = { ok, ext, depth: ok ? depth : Infinity };
+      memo.set(name, res);
+      return res;
+    };
+    for (const name of templates.keys()) {
+      const r = analyzeMemo(name);
+      if (r.ok && r.ext.size === 1) {
+        const v = [...r.ext][0];
+        ctx.memoInfo.set(name, { var: v, path: [v], depth: r.depth });
+      }
+    }
+  }
   // One top scope per case: its render-specific keys (page, posts, pager,
   // tag) are overwritten per render and cleared to undefined after, which
   // reads exactly like an absent key, so no fresh object per render.
-  const topVars = { site, tags: allTags, recent };
+  const topVars = Object.create(null);
+  topVars.site = site;
+  topVars.tags = allTags;
+  topVars.recent = recent;
   const topScope = { vars: topVars, parent: null };
   const renderOut = [];
   const render = (name, vars) => {
@@ -986,6 +1153,10 @@ export function run(input) {
     renderNodes(nodes, topScope, ctx, 0, renderOut);
     return renderOut.join('');
   };
+  for (const name of ctx.staticInfo.keys()) {
+    const html = render(name, {});
+    if (html !== null) ctx.staticCache.set(name, html);
+  }
   for (const s of kept) {
     const card = s.post ? cards.get(s) : cardOf(s);
     const page = {
