@@ -5,8 +5,9 @@
 //
 // Speed ideas, in brief:
 //  - Markdown is rendered in one fused pass over the body's lines (no token
-//    objects), and inline markup is scanned once with plain-text runs escaped
-//    in bulk instead of one regex call per character.
+//    objects), and inline markup is scanned once with HTML escaping fused
+//    into that scan, so a plain run is pushed raw instead of re-scanned by
+//    a replace call; each page's blocks render into one shared array.
 //  - slugify takes a native-regex fast path for ASCII text (the common case)
 //    and only normalises when non-ASCII is present; tag slugs are computed
 //    once per tag instead of three times.
@@ -271,12 +272,14 @@ function findSingleStar(s, from) {
   return -1;
 }
 
-/** The next index from `from` holding one of \ ` * [, or -1. One native
- * regex scan; the plain run between two such characters needs no
- * per-character walk. The shared regex is safe across inline()'s
- * recursion because every search sets lastIndex first.
+/** The next index from `from` holding one of \ ` * [ or an escapable
+ * character (& < > " '), or -1. One native regex scan; the plain run
+ * between two such characters needs no per-character walk, and an
+ * escapable character is emitted as its entity right here, so inline()
+ * never calls escapeHtml on a plain run. The shared regex is safe across
+ * inline()'s recursion because every search sets lastIndex first.
  */
-const SPECIAL_RE = /[\\`*[]/g;
+const SPECIAL_RE = /[\\`*[&<>"']/g;
 function nextSpecial(s, from) {
   SPECIAL_RE.lastIndex = from;
   const m = SPECIAL_RE.exec(s);
@@ -285,8 +288,9 @@ function nextSpecial(s, from) {
 
 /**
  * `s` rendered inline, fragments pushed to `out`. The scan jumps from one
- * markup character to the next with indexOf; the plain text between them is
- * escaped in bulk. A construct that fails to close stays in the plain run
+ * markup character to the next; the plain text between them is pushed raw,
+ * because the scan also stops at every escapable character and emits its
+ * entity inline. A construct that fails to close stays in the plain run
  * (the run's start only moves past a construct that succeeds).
  * `env.link(target)` resolves a link's href.
  */
@@ -298,17 +302,32 @@ function inline(s, env, out) {
     const j = nextSpecial(s, i);
     if (j === -1) break;
     const c = s[j];
-    if (c === '\\' && j + 1 < len && ESCAPABLE.has(s[j + 1])) {
-      if (j > plain) out.push(escapeHtml(s.slice(plain, j)));
-      out.push(ESCAPES[s[j + 1]] || s[j + 1]);
-      i = j + 2;
+    if (c === '\\') {
+      // An escapable character after the backslash is emitted literally
+      // (or as its entity); any other character leaves the backslash in
+      // the plain run, and the link scan below must not run for it: the
+      // reference keeps `\x](url)` literal, it is not a link.
+      if (j + 1 < len && ESCAPABLE.has(s[j + 1])) {
+        if (j > plain) out.push(s.slice(plain, j));
+        out.push(ESCAPES[s[j + 1]] || s[j + 1]);
+        i = j + 2;
+        plain = i;
+      } else {
+        i = j + 1;
+      }
+      continue;
+    }
+    if (c === '&' || c === '<' || c === '>' || c === '"' || c === "'") {
+      if (j > plain) out.push(s.slice(plain, j));
+      out.push(ESCAPES[c]);
+      i = j + 1;
       plain = i;
       continue;
     }
     if (c === '`') {
       const k = s.indexOf('`', j + 1);
       if (k > j + 1) {
-        if (j > plain) out.push(escapeHtml(s.slice(plain, j)));
+        if (j > plain) out.push(s.slice(plain, j));
         out.push('<code>', escapeHtml(s.slice(j + 1, k)), '</code>');
         i = k + 1;
         plain = i;
@@ -319,7 +338,7 @@ function inline(s, env, out) {
       if (s.charCodeAt(j + 1) === 42) {
         const k = findUnescaped(s, '**', j + 2);
         if (k > j + 2) {
-          if (j > plain) out.push(escapeHtml(s.slice(plain, j)));
+          if (j > plain) out.push(s.slice(plain, j));
           out.push('<strong>');
           inline(s.slice(j + 2, k), env, out);
           out.push('</strong>');
@@ -330,7 +349,7 @@ function inline(s, env, out) {
       }
       const k = findSingleStar(s, j + 1);
       if (k > j + 1) {
-        if (j > plain) out.push(escapeHtml(s.slice(plain, j)));
+        if (j > plain) out.push(s.slice(plain, j));
         out.push('<em>');
         inline(s.slice(j + 1, k), env, out);
         out.push('</em>');
@@ -343,7 +362,7 @@ function inline(s, env, out) {
     const m = k !== -1 && s.charCodeAt(k + 1) === 40 ? s.indexOf(')', k + 2) : -1;
     const target = m === -1 ? '' : s.slice(k + 2, m);
     if (target !== '' && !MD_WS_IN_LINK.test(target)) {
-      if (j > plain) out.push(escapeHtml(s.slice(plain, j)));
+      if (j > plain) out.push(s.slice(plain, j));
       out.push('<a href="', escapeHtml(env.link(target)), '">');
       inline(s.slice(j + 1, k), env, out);
       out.push('</a>');
@@ -351,21 +370,30 @@ function inline(s, env, out) {
       plain = i;
     } else i = j + 1;
   }
-  if (len > plain) out.push(escapeHtml(s.slice(plain)));
+  if (len > plain) out.push(s.slice(plain));
 }
 
 /**
  * `src` rendered in one fused pass over its lines (no token objects): its
  * HTML, its table of contents (every level 2 and 3 heading) and its excerpt
- * (the first paragraph's inline HTML, or "").
+ * (the first paragraph's inline HTML, or ""). Every block's fragments go
+ * straight into one shared array, with one '\n' between blocks and one
+ * trailing — exactly blocks.join('\n') + '\n'. A heading's toc HTML and
+ * the excerpt are the joins of the fragment ranges inline() wrote for
+ * them, so no per-block array or join is ever built.
  */
 function renderMarkdown(src, env) {
   const lines = src.split('\n');
   const n = lines.length;
   const ids = new Set();
-  const blocks = [];
+  const out = [];
   const toc = [];
   let excerpt = null;
+  let blocks = 0;
+  const sep = () => {
+    if (blocks > 0) out.push('\n');
+    blocks++;
+  };
   let i = 0;
   while (i < n) {
     const line = lines[i];
@@ -388,7 +416,8 @@ function renderMarkdown(src, env) {
         i++;
         while (i < n && !(lines[i].startsWith('```') && MD_FENCE_CLOSE.test(lines[i]))) body.push(lines[i++]);
         i++;
-        blocks.push(
+        sep();
+        out.push(
           '<pre><code' +
             (lang === '' ? '' : ' class="language-' + lang + '"') +
             '>' +
@@ -401,17 +430,20 @@ function renderMarkdown(src, env) {
       const h = headingOf(line);
       if (h !== null) {
         const id = uniqueSlug(slugify(h.text), ids);
-        const frag = [];
-        inline(h.text, env, frag);
-        const html = frag.join('');
-        blocks.push('<h' + h.depth + ' id="' + id + '">' + html + '</h' + h.depth + '>');
-        if (h.depth === 2 || h.depth === 3) toc.push({ level: h.depth, id, html });
+        sep();
+        out.push('<h' + h.depth + ' id="' + id + '">');
+        const hs = out.length;
+        inline(h.text, env, out);
+        const he = out.length;
+        out.push('</h' + h.depth + '>');
+        if (h.depth === 2 || h.depth === 3) toc.push({ level: h.depth, id, html: out.slice(hs, he).join('') });
         i++;
         continue;
       }
     } else if (ch === 45 || ch === 42) {
       if (MD_HR.test(line)) {
-        blocks.push('<hr>');
+        sep();
+        out.push('<hr>');
         i++;
         continue;
       }
@@ -423,7 +455,13 @@ function renderMarkdown(src, env) {
         const t = trimLine(body[k]);
         if (t !== '') inner.push(t);
       }
-      blocks.push(inner.length === 0 ? '<blockquote>\n</blockquote>' : '<blockquote>\n<p>' + inlineJoin(inner.join('\n'), env) + '</p>\n</blockquote>');
+      sep();
+      if (inner.length === 0) out.push('<blockquote>\n</blockquote>');
+      else {
+        out.push('<blockquote>\n<p>');
+        inline(inner.join('\n'), env, out);
+        out.push('</p>\n</blockquote>');
+      }
       continue;
     }
     // List, or a paragraph.
@@ -448,27 +486,29 @@ function renderMarkdown(src, env) {
       const start = isOrdered ? Number(ordered[1]) : 1;
       const tag = isOrdered ? 'ol' : 'ul';
       const open = isOrdered && start !== 1 ? '<ol start="' + start + '">' : '<' + tag + '>';
-      const parts = [open + '\n'];
-      for (let k = 0; k < items.length; k++) parts.push('<li>' + inlineJoin(items[k].join('\n'), env) + '</li>\n');
-      parts.push('</' + tag + '>');
-      blocks.push(parts.join(''));
+      sep();
+      out.push(open + '\n');
+      for (let k = 0; k < items.length; k++) {
+        out.push('<li>');
+        inline(items[k].join('\n'), env, out);
+        out.push('</li>\n');
+      }
+      out.push('</' + tag + '>');
       continue;
     }
     const body = [trimLine(line)];
     i++;
     while (i < n && !endsParagraph(lines[i])) body.push(trimLine(lines[i++]));
-    const html = inlineJoin(body.join('\n'), env);
-    if (excerpt === null) excerpt = html;
-    blocks.push('<p>' + html + '</p>');
+    sep();
+    out.push('<p>');
+    const es = out.length;
+    inline(body.join('\n'), env, out);
+    const ee = out.length;
+    out.push('</p>');
+    if (excerpt === null) excerpt = out.slice(es, ee).join('');
   }
-  return { html: blocks.length === 0 ? '' : blocks.join('\n') + '\n', toc, excerpt: excerpt === null ? '' : excerpt };
-}
-
-/** Inline-render `s` to a single string (small wrapper over inline()). */
-function inlineJoin(s, env) {
-  const out = [];
-  inline(s, env, out);
-  return out.join('');
+  if (blocks > 0) out.push('\n');
+  return { html: out.join(''), toc, excerpt: excerpt === null ? '' : excerpt };
 }
 
 /* -------------------------------------------------------- templates ---- */
@@ -829,12 +869,19 @@ export function run(input) {
   // ordered by count then slug. A page's tags link to the posts' tag of the
   // same slug, or to "" where no post has it.
   const bySlug = new Map();
+  // slugify is pure and tag names repeat across a case's pages: cache
+  // them per case (never across cases; run() is called once per case).
+  const tagSlugCache = new Map();
   const ownTags = (s) => {
     const seen = new Set();
     const out = [];
     const tags = s.data.tags !== undefined ? s.data.tags : [];
     for (const name of tags) {
-      const slug = slugify(name);
+      let slug = tagSlugCache.get(name);
+      if (slug === undefined) {
+        slug = slugify(name);
+        tagSlugCache.set(name, slug);
+      }
       if (!seen.has(slug)) {
         seen.add(slug);
         out.push({ name, slug });
